@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MAX_AUDIO_BYTES = 20 * 1024 * 1024
-MAX_TELEGRAM_TEXT = 3500
+MAX_TELEGRAM_TEXT = 1900  # safe even when every character counts as two UTF-16 units
 AUDIO_EXTENSIONS = {".ogg", ".oga", ".mp3", ".mpga", ".mpeg", ".m4a", ".mp4", ".wav", ".webm", ".flac"}
 
 
