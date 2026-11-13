@@ -69,6 +69,10 @@ class MediaTests(unittest.TestCase):
         self.assertTrue(all(0 < len(x) <= 200 for x in chunks))
         self.assertEqual(" ".join(chunks), original.strip())
 
+    def test_emoji_chunks_fit_telegram_utf16_limit(self):
+        for chunk in voicy.split_text("😀" * 3000):
+            self.assertLessEqual(len(chunk.encode("utf-16-le")) // 2, 4096)
+
     def test_caption_hint(self):
         self.assertEqual(voicy.name_hints_from_caption("Имена: Мария, Роман"), "Мария, Роман")
         self.assertEqual(voicy.name_hints_from_caption("любые слова"), "")
