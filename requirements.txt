@@ -1,0 +1,2 @@
+# Pinned upstream Humanizer Framework revision, not a floating main branch.
+humanizer-framework @ git+https://github.com/orelkrylatiy/humanizer-framework.git@6660ba2cc3f6536a5ee0b7f3735228cab5458e76
