@@ -387,8 +387,16 @@ def run_polling(bot: Bot) -> None:
                 user_id = (msg.get("from") or {}).get("id")
                 if chat_id is None or user_id is None:
                     continue
-                bot.handle(chat_id, user_id, msg,
-                           lambda content, chat_id=chat_id: api.send(chat_id, content), api.fetch_audio)
+                replies = 0
+
+                def send_reply(content: str) -> None:
+                    nonlocal replies
+                    api.send(chat_id, content)
+                    replies += 1
+
+                bot.handle(chat_id, user_id, msg, send_reply, api.fetch_audio)
+                kind = "audio" if choose_media(msg) else "text"
+                print(f"Voicy update processed: {kind}, replies={replies}", flush=True)
         except urllib.error.HTTPError as exc:
             print(f"Telegram HTTP error: {exc.code}", file=sys.stderr)
             if exc.code == 409:
