@@ -1,0 +1,11 @@
+[project]
+type = "service"
+delivery = "source"
+keep_releases = 10
+build_commands = [["python3", "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--target", "vendor", "-r", "requirements.txt"]]
+build_timeout_seconds = 1800
+shared_files = [".env"]
+shared_dirs = []
+
+[service]
+unit = "voicy.service"

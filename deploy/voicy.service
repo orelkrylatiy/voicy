@@ -1,0 +1,19 @@
+[Unit]
+Description=Voicy Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/var/www/projects/voicy/current
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/var/www/projects/voicy/current/vendor
+ExecStart=/usr/bin/python3 /var/www/projects/voicy/current/transcribe_bot.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
