@@ -5,6 +5,7 @@ The default transport uses the Telegram Bot API. No web server or Mini App.
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -18,6 +19,30 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+
+LOG = logging.getLogger("voicy")
+POLL_MAX_DELAY = 60
+
+
+def log_failure(event: str, exc: Exception, *, level: int = logging.WARNING) -> None:
+    # Never log exception messages, tracebacks, request URLs or provider payloads:
+    # Telegram URLs contain the bot token and provider responses may contain text.
+    status = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+    LOG.log(level, "%s error_type=%s http_status=%s", event, type(exc).__name__, status)
+
+
+def retry_delay(exc: Exception, fallback: int) -> int:
+    if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
+        try:
+            header = exc.headers.get("Retry-After") if exc.headers else None
+            value = int(header) if header is not None else int(
+                json.loads(exc.read(16384)).get("parameters", {}).get("retry_after", 0)
+            )
+            return max(fallback, value)
+        except (ValueError, TypeError, AttributeError, OSError):
+            pass
+    return fallback
+
 
 MAX_AUDIO_BYTES = 20 * 1024 * 1024
 MAX_TELEGRAM_TEXT = 1900  # safe even when every character counts as two UTF-16 units
@@ -185,7 +210,7 @@ class HumanizerBridge:
                     raise ValueError("Transcript edit changed length too much")
                 edits.append(edited.strip())
             except Exception as exc:
-                print(f"Humanizer transcript edit skipped: {type(exc).__name__}", file=sys.stderr)
+                log_failure("humanizer_edit_fallback", exc)
                 edits.append(chunk)
         return "\n\n".join(edits)
 
@@ -224,13 +249,15 @@ def transcribe_openai(audio: bytes, filename: str, settings: Settings, name_hint
     )
     with urllib.request.urlopen(request, timeout=180) as response:
         result = json.load(response)
-    if not isinstance(result.get("text"), str):
+    if not isinstance(result, dict) or not isinstance(result.get("text"), str):
         raise ValueError("OpenAI did not return a text transcript")
     return result["text"].strip()
 
 
 def split_text(text: str, size: int = MAX_TELEGRAM_TEXT) -> list[str]:
     """Chunk plain text at word/line boundaries without losing any words."""
+    if size <= 0:
+        raise ValueError("Chunk size must be positive")
     result: list[str] = []
     remainder = text.strip()
     while remainder:
@@ -306,21 +333,34 @@ class Bot:
             if int(media.get("file_size") or 0) > MAX_AUDIO_BYTES:
                 send("Аудио больше 20 МБ. Пришли файл меньшего размера.")
                 return
+            started = time.monotonic()
             send("Расшифровываю аудио…")
             hints = name_hints_from_caption(str(message.get("caption", "")))
             try:
                 audio, filename = fetch_audio(media)
                 transcript = transcribe_openai(audio, filename, self.settings, hints)
-            except (urllib.error.URLError, OSError, ValueError, KeyError, RuntimeError) as exc:
-                print(f"Transcription failed: {type(exc).__name__}", file=sys.stderr)
-                send("Не удалось распознать аудио. Проверь формат и попробуй ещё раз.")
+            except Exception as exc:
+                log_failure("transcription_failed", exc)
+                if isinstance(exc, urllib.error.HTTPError) and (exc.code == 429 or exc.code >= 500):
+                    send("Сервис распознавания временно недоступен. Попробуй позже.")
+                elif isinstance(exc, (OSError, urllib.error.URLError)) and not isinstance(exc, urllib.error.HTTPError):
+                    send("Сетевая ошибка при распознавании. Попробуй позже.")
+                else:
+                    send("Не удалось распознать аудио. Проверь формат и попробуй ещё раз.")
                 return
             if not transcript:
                 send("В записи не удалось распознать речь.")
                 return
             if self.settings.transcribe_edit == "humanizer" and self.humanizer is not None:
-                transcript = self.humanizer.edit_transcript(transcript, hints)
+                try:
+                    edited = self.humanizer.edit_transcript(transcript, hints)
+                    if not isinstance(edited, str) or not edited.strip():
+                        raise ValueError("Empty edit")
+                    transcript = edited
+                except Exception as exc:
+                    log_failure("humanizer_edit_fallback", exc)
             send(transcript)
+            LOG.info("transcription_delivered elapsed_ms=%d", (time.monotonic() - started) * 1000)
             return
         if text and not text.startswith("/"):
             if self.humanizer is None:
@@ -333,12 +373,12 @@ class Bot:
                 if not response:
                     raise ValueError("Empty Humanizer response")
             except Exception as exc:
-                print(f"Humanizer reply failed: {type(exc).__name__}", file=sys.stderr)
+                log_failure("humanizer_reply_failed", exc)
                 send("Не удалось подготовить ответ. Попробуй позже.")
                 return
+            send(response)
             history.extend([("user", text), ("assistant", response)])
             del history[:-8]
-            send(response)
 
 
 class TelegramAPI:
@@ -354,7 +394,7 @@ class TelegramAPI:
         )
         with urllib.request.urlopen(request, timeout=45) as response:
             body = json.load(response)
-        if not body.get("ok"):
+        if not isinstance(body, dict) or not body.get("ok") or "result" not in body:
             raise RuntimeError(f"Telegram {method} failed")
         return body["result"]
 
@@ -376,18 +416,43 @@ class TelegramAPI:
 def run_polling(bot: Bot) -> None:
     api = TelegramAPI(bot.settings.telegram_token)
     offset = 0
-    print("Voicy polling started", flush=True)
+    delay = 1
+    LOG.info("polling_started")
     while True:
         try:
             updates = api.call("getUpdates", {"timeout": 25, "offset": offset, "allowed_updates": '["message"]'})
-            for update in updates:
-                offset = int(update["update_id"]) + 1
+            if not isinstance(updates, list):
+                raise ValueError("Invalid updates response")
+        except Exception as exc:
+            if isinstance(exc, urllib.error.HTTPError) and exc.code in (401, 403, 409):
+                log_failure("polling_fatal", exc, level=logging.ERROR)
+                raise RuntimeError("Telegram polling authorization or instance conflict") from None
+            wait = retry_delay(exc, delay)
+            log_failure("polling_failed", exc)
+            LOG.info("polling_backoff seconds=%d", wait)
+            time.sleep(wait)
+            delay = min(delay * 2, POLL_MAX_DELAY)
+            continue
+        delay = 1
+        for update in updates:
+            if not isinstance(update, dict) or not isinstance(update.get("update_id"), int):
+                LOG.warning("invalid_update")
+                continue
+            update_id = update["update_id"]
+            if update_id < offset:
+                continue
+            # Best-effort delivery: never replay a partly sent response.
+            offset = update_id + 1
+            started = time.monotonic()
+            replies = 0
+            kind = "unknown"
+            try:
                 msg = update.get("message") or {}
                 chat_id = (msg.get("chat") or {}).get("id")
                 user_id = (msg.get("from") or {}).get("id")
-                if chat_id is None or user_id is None:
+                if chat_id is None or user_id is None or not bot.settings.authorized(user_id):
                     continue
-                replies = 0
+                kind = "audio" if choose_media(msg) else "text"
 
                 def send_reply(content: str) -> None:
                     nonlocal replies
@@ -395,16 +460,15 @@ def run_polling(bot: Bot) -> None:
                     replies += 1
 
                 bot.handle(chat_id, user_id, msg, send_reply, api.fetch_audio)
-                kind = "audio" if choose_media(msg) else "text"
-                print(f"Voicy update processed: {kind}, replies={replies}", flush=True)
-        except urllib.error.HTTPError as exc:
-            print(f"Telegram HTTP error: {exc.code}", file=sys.stderr)
-            if exc.code == 409:
-                raise RuntimeError("Telegram conflict: disable webhook or stop another bot instance") from exc
-            time.sleep(3)
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError, RuntimeError) as exc:
-            print(f"Polling error: {type(exc).__name__}", file=sys.stderr)
-            time.sleep(3)
+            except Exception as exc:
+                log_failure("update_failed", exc, level=logging.ERROR)
+                LOG.info("update_delivery kind=%s outcome=failed replies=%d elapsed_ms=%d",
+                         kind, replies, (time.monotonic() - started) * 1000)
+                if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
+                    time.sleep(retry_delay(exc, 1))
+                continue
+            LOG.info("update_delivery kind=%s outcome=handled replies=%d elapsed_ms=%d",
+                     kind, replies, (time.monotonic() - started) * 1000)
 
 
 async def run_mtproto(bot: Bot) -> None:
@@ -423,6 +487,12 @@ async def run_mtproto(bot: Bot) -> None:
 
     @client.on(events.NewMessage(incoming=True))
     async def on_message(event):
+        try:
+            await process_message(event)
+        except Exception as exc:
+            log_failure("mtproto_update_failed", exc, level=logging.ERROR)
+
+    async def process_message(event):
         if not bot.settings.authorized(event.sender_id):
             return
         if not (event.voice or event.audio or event.raw_text):
@@ -439,36 +509,46 @@ async def run_mtproto(bot: Bot) -> None:
 
             def send(text: str) -> None:
                 for chunk in split_text(text):
-                    asyncio.run_coroutine_threadsafe(event.respond(chunk, parse_mode=None), loop).result()
+                    asyncio.run_coroutine_threadsafe(
+                        asyncio.wait_for(event.respond(chunk, parse_mode=None), timeout=45), loop
+                    ).result()
 
             def fetch_audio(_: dict) -> tuple[bytes, str]:
-                data = asyncio.run_coroutine_threadsafe(client.download_media(event.message, file=bytes), loop).result()
-                if not data:
-                    raise ValueError("Empty Telegram media")
+                data = asyncio.run_coroutine_threadsafe(
+                    asyncio.wait_for(client.download_media(event.message, file=bytes), timeout=120), loop
+                ).result()
+                if not data or len(data) > MAX_AUDIO_BYTES:
+                    raise ValueError("Empty or oversized Telegram media")
                 return data, media["filename"]
 
+            started = time.monotonic()
             await asyncio.to_thread(bot.handle, event.chat_id, event.sender_id, msg, send, fetch_audio)
+            LOG.info("mtproto_update_handled elapsed_ms=%d", (time.monotonic() - started) * 1000)
 
     async with await client.start(bot_token=bot.settings.telegram_token):
         me = await client.get_me()
         if str(me.id) != bot.settings.telegram_token.split(":", 1)[0]:
             raise RuntimeError("Telegram session belongs to another bot")
-        print("Voicy MTProto started", flush=True)
+        LOG.info("mtproto_started")
         await client.run_until_disconnected()
 
 
 def main() -> int:
-    load_dotenv(Path(__file__).with_name(".env"))
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s",
+                        stream=sys.stderr)
     try:
+        load_dotenv(Path(__file__).with_name(".env"))
         settings = Settings.from_env()
-    except ValueError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
+    except Exception as exc:
+        log_failure("configuration_failed", exc, level=logging.ERROR)
         return 2
+    LOG.info("startup transport=%s transcription=%s editing=%s public=%s",
+             settings.transport, settings.transcribe_mode, settings.transcribe_edit, settings.allow_public)
     try:
         humanizer = HumanizerBridge(settings)
-    except (ImportError, ValueError, RuntimeError) as exc:
+    except Exception as exc:
         humanizer = None
-        print(f"Humanizer not available: {type(exc).__name__}", file=sys.stderr)
+        log_failure("humanizer_unavailable", exc)
     bot = Bot(settings, humanizer)
     try:
         if settings.transport == "mtproto":
@@ -477,7 +557,11 @@ def main() -> int:
         else:
             run_polling(bot)
     except KeyboardInterrupt:
+        LOG.info("shutdown_requested")
         return 0
+    except Exception as exc:
+        log_failure("transport_failed", exc, level=logging.ERROR)
+        return 1
     return 0
 
 

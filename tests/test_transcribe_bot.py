@@ -171,5 +171,74 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(calls[0].kwargs["channel"], "telegram")
 
 
+class ReliabilityTests(unittest.TestCase):
+    def test_edit_failure_delivers_raw_transcript_without_logging_content(self):
+        hz = FakeHumanizer()
+        answers = []
+        with patch.object(hz, "edit_transcript", side_effect=RuntimeError("PRIVATE-TEXT")), \
+                patch.object(voicy, "transcribe_openai", return_value="original"), \
+                self.assertLogs("voicy", level="WARNING") as logs:
+            voicy.Bot(settings(), hz).handle(
+                100, 42, {"voice": {"file_id": "f"}}, answers.append,
+                lambda _: (b"audio", "voice.ogg"))
+        self.assertEqual(answers[-1], "original")
+        self.assertNotIn("PRIVATE-TEXT", " ".join(logs.output))
+
+    def test_failed_send_does_not_add_undelivered_reply_to_history(self):
+        bot = voicy.Bot(settings(), FakeHumanizer())
+        with self.assertRaises(OSError):
+            bot.handle(100, 42, {"text": "hello"},
+                       lambda _: (_ for _ in ()).throw(OSError("send failed")), None)
+        self.assertEqual(bot.history.get("100:42"), [])
+
+    def test_polling_continues_after_failed_update(self):
+        bot = voicy.Bot(settings(), FakeHumanizer())
+        updates = [
+            {"update_id": i, "message": {"chat": {"id": 100}, "from": {"id": 42}, "text": "hello"}}
+            for i in (1, 2)
+        ]
+        with patch.object(voicy, "TelegramAPI") as api_class, self.assertLogs("voicy", level="INFO") as logs:
+            api = api_class.return_value
+            api.call.side_effect = [updates, KeyboardInterrupt()]
+            api.send.side_effect = [OSError("SECRET"), None]
+            with self.assertRaises(KeyboardInterrupt):
+                voicy.run_polling(bot)
+        self.assertEqual(api.send.call_count, 2)
+        self.assertEqual(api.call.call_args_list[-1].args[1]["offset"], 3)
+        self.assertNotIn("SECRET", " ".join(logs.output))
+        self.assertIn("update_failed", " ".join(logs.output))
+
+    def test_polling_backoff_resets_after_success(self):
+        bot = voicy.Bot(settings())
+        with patch.object(voicy, "TelegramAPI") as api_class, patch.object(voicy.time, "sleep") as sleep:
+            api_class.return_value.call.side_effect = [
+                OSError(), OSError(), [], OSError(), KeyboardInterrupt()]
+            with self.assertRaises(KeyboardInterrupt):
+                voicy.run_polling(bot)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [1, 2, 1])
+
+    def test_rate_limit_uses_retry_after(self):
+        error = voicy.urllib.error.HTTPError(
+            "https://example.invalid/SECRET", 429, "limit", {"Retry-After": "17"}, None)
+        self.assertEqual(voicy.retry_delay(error, 2), 17)
+        error = voicy.urllib.error.HTTPError(
+            "https://example.invalid/SECRET", 429, "limit", {},
+            io.BytesIO(b'{"parameters":{"retry_after":23}}'))
+        self.assertEqual(voicy.retry_delay(error, 2), 23)
+
+    def test_polling_fatal_error_does_not_expose_url(self):
+        error = voicy.urllib.error.HTTPError("https://example.invalid/SECRET", 409, "conflict", {}, None)
+        with patch.object(voicy, "TelegramAPI") as api_class, self.assertLogs("voicy", level="ERROR") as logs:
+            api_class.return_value.call.side_effect = error
+            with self.assertRaises(RuntimeError) as raised:
+                voicy.run_polling(voicy.Bot(settings()))
+        self.assertTrue(raised.exception.__suppress_context__)
+        self.assertNotIn("SECRET", " ".join(logs.output))
+
+    def test_invalid_chunk_size(self):
+        with self.assertRaises(ValueError):
+            voicy.split_text("abc", 0)
+
+
 if __name__ == "__main__":
     unittest.main()
